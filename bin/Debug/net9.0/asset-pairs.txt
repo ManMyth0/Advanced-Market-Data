@@ -1,0 +1,25 @@
+# Coinbase Advanced API - Supported Asset Pairs
+# RATE LIMITS: 8 messages/sec (unauthenticated) = MAX 4 pairs, 100 messages/sec (authenticated) = MAX 50 pairs
+# Each asset pair uses 2 messages: heartbeats + candles subscription
+# Format: ASSET-QUOTE (e.g., BTC-USD)
+# One pair per line, comments start with #
+
+# Major Cryptocurrencies (3 pairs = safe for unauthenticated mode)
+#BTC-USD
+#ETH-USD
+#SOL-USD
+# WARNING: Add more pairs ONLY with API authentication (see README)
+
+# Popular Altcoins (commented out by default)
+# ADA-USD
+# DOT-USD
+# MATIC-USD
+# DOGE-USD
+# SHIB-USD
+
+# Stablecoins
+# USDC-USD
+# DAI-USD
+
+# Add your own pairs here. This will result to BTC-USD as a default...
+BTC-USD

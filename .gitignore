@@ -1,0 +1,7 @@
+# Local Secrets
+.env
+sercrets.json
+
+# To Do Lists
+TODO.md
+TODO-COINBASE-API.md
