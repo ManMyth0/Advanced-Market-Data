@@ -1,4 +1,4 @@
-﻿using System.Linq;
+using System.Linq;
 using System.Text.Json;
 using System.Globalization;
 using System.Net.WebSockets;
@@ -215,7 +215,7 @@ namespace AdvancedMarketData.Core.Services
             _logger.LogDebug("Sent {MessageType} message: {Json}", messageType, json);
         }
 
-        public async Task StartStreamingAsync(string[] channels, string[] productIds, CancellationToken ct)
+        public async Task StartStreamingAsync(string[] channels, string[] productIds, CancellationToken ct, bool includeSnapshotCandles = true)
         {
             int reconnectAttempts = 0;
             
@@ -229,7 +229,7 @@ namespace AdvancedMarketData.Core.Services
                     _logger.LogInformation("Connecting to WebSocket for channels [{Channels}] with products [{Products}] (attempt {Attempt}/{MaxAttempts})", 
                         channelList, productList, reconnectAttempts + 1, _maxReconnectAttempts);
                     
-                    await ConnectAndStreamAsync(channels, productIds, ct);
+                    await ConnectAndStreamAsync(channels, productIds, ct, includeSnapshotCandles);
                     
                     // If we get here, the connection was successful and completed normally
                     _logger.LogInformation("WebSocket stream completed normally for channels [{Channels}]", channelList);
@@ -270,7 +270,7 @@ namespace AdvancedMarketData.Core.Services
             }
         }
 
-        private async Task ConnectAndStreamAsync(string[] channels, string[] productIds, CancellationToken ct)
+        private async Task ConnectAndStreamAsync(string[] channels, string[] productIds, CancellationToken ct, bool includeSnapshotCandles)
         {
             using var ws = new ClientWebSocket();
             
@@ -358,7 +358,7 @@ namespace AdvancedMarketData.Core.Services
                             else
                             {
                                 // Process the complete message based on channel type (no verbose logging)
-                                ProcessWebSocketMessage(json, connectionId);
+                                ProcessWebSocketMessage(json, connectionId, includeSnapshotCandles);
                             }
                             
                             // Clear buffer for next message
@@ -392,7 +392,7 @@ namespace AdvancedMarketData.Core.Services
             _logger.LogInformation("WebSocket connection closed for products [{Products}]", closedProducts);
         }
 
-        private void ProcessWebSocketMessage(string json, string connectionId)
+        private void ProcessWebSocketMessage(string json, string connectionId, bool includeSnapshotCandles)
         {
             try
             {
@@ -411,7 +411,7 @@ namespace AdvancedMarketData.Core.Services
                 else if (message.Channel == "candles")
                 {
                     // Extract productId from the candle events in the message
-                    ProcessCandleMessage(message, ExtractProductIdFromMessage(message));
+                    ProcessCandleMessage(message, ExtractProductIdFromMessage(message), includeSnapshotCandles);
                 }
                 else
                 {
@@ -442,7 +442,7 @@ namespace AdvancedMarketData.Core.Services
             return "UNKNOWN";
         }
 
-        private void ProcessCandleMessage(CoinbaseWebSocketMessage message, string productId)
+        private void ProcessCandleMessage(CoinbaseWebSocketMessage message, string productId, bool includeSnapshotCandles)
         {
             try
             {
@@ -460,9 +460,16 @@ namespace AdvancedMarketData.Core.Services
                     switch (eventType)
                     {
                         case "snapshot":
-                            _logger.LogInformation("Received candle snapshot for {ProductId} with {CandleCount} candles", 
-                                productId, eventData.Candles?.Length ?? 0);
-                            ProcessCandleEvent(eventData, productId, isSnapshot: true);
+                            if (includeSnapshotCandles)
+                            {
+                                _logger.LogInformation("Received candle snapshot for {ProductId} with {CandleCount} candles", 
+                                    productId, eventData.Candles?.Length ?? 0);
+                                ProcessCandleEvent(eventData, productId, isSnapshot: true);
+                            }
+                            else
+                            {
+                                _logger.LogDebug("Skipping snapshot candles for {ProductId} (live-only behavior)", productId);
+                            }
                             break;
                             
                         case "update":

@@ -1,7 +1,20 @@
 # Local Secrets
 .env
-sercrets.json
+secrets.json
 
 # To Do Lists
 TODO.md
 TODO-COINBASE-API.md
+
+# Cursor
+cursor.md
+
+# .NET build output
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates

@@ -1,4 +1,4 @@
-﻿using CsvHelper;
+using CsvHelper;
 using System.Globalization;
 using AdvancedMarketData.Core.Models;
 using AdvancedMarketData.Core.Interfaces;
@@ -18,7 +18,7 @@ namespace AdvancedMarketData.Core.Services
             : "No data";
         
         // Write only essential metadata with proper spacing
-        writer.WriteLine($"{exportTime:yyyy-MM-dd HH:mm:ss UTC}, {candleList.Count} Candles (5-minute), {dateRange}");
+        writer.WriteLine($"{exportTime:yyyy-MM-dd HH:mm:ss UTC}, {candleList.Count} Candles, {dateRange}");
         writer.WriteLine(); // Empty line for separation
         
         // Write candle data with proper spacing and descriptive labels

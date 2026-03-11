@@ -3,6 +3,34 @@
 
 A standalone .NET 9.0 application that streams real-time cryptocurrency market data from Coinbase Advanced API. Features live WebSocket connections, multi-asset streaming, intelligent price formatting, CSV export, JWT authentication, and clean real-time output display.
 
+## Current Behavior (Authoritative)
+
+This section is the source of truth for the current runtime behavior.
+
+- **Live mode (`live-only`)**
+  - Uses Coinbase Advanced Trade WebSocket `candles` channel.
+  - Snapshot candles are skipped, so only live update flow is ingested.
+  - Coinbase live candle buckets are fixed at **5 minutes**.
+  - `--granularity` is not allowed in `live-only` mode (fails fast).
+- **Historical mode (`historical-only`)**
+  - Uses Coinbase Exchange REST candles endpoint with date range chunking.
+  - Supported granularity values:
+    - Seconds: `60, 300, 900, 3600, 21600, 86400`
+    - Names: `OneMinute, FiveMinutes, FifteenMinutes, OneHour, SixHours, OneDay`
+  - Uses max `300` candles/request and automatically paginates a full UTC day.
+  - Auto-exports CSV at completion and exits automatically.
+- **Historical + live mode (`historical-then-live`)**
+  - Advanced mode for one-command preload + stream workflows.
+  - Loads historical candles first from input date `00:00:00` UTC up to current UTC time.
+  - Uses fixed 5-minute granularity for this backfill.
+  - Then starts live stream (5-minute WebSocket candles).
+  - Uses a continuous 5-minute interval across backfill and live stream.
+
+### Important Data Caveat
+
+For historical candles, Coinbase documents that intervals with no ticks may be missing, so full-day minute coverage is product/day dependent. Reference:
+- [Get product candles (Exchange API)](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-candles)
+
 ## Features
 
 - **Live Market Data**: Real-time cryptocurrency price and volume updates
@@ -11,7 +39,8 @@ A standalone .NET 9.0 application that streams real-time cryptocurrency market d
 - **Independent Stream Management**: Each asset has its own heartbeat tracking and connection health
 - **WebSocket Streaming**: Direct connection to Coinbase Advanced API WebSocket endpoints  
 - **Flexible Input**: Command-line arguments, interactive prompts, or predefined asset lists
-- **5-Minute Candles**: OHLCV data with historical snapshots and live updates
+- **Configurable Candle Granularity**: 1m, 5m, 15m, 1h, 6h, 1d controls
+- **Historical + Live Modes**: Query a day of historical OHLCV, stream live-only, or chain both
 - **Authentication Support**: Optional JWT authentication for higher rate limits and private data
 - **Connection Health**: Automatic heartbeat monitoring and reconnection handling
 - **Smart CSV Export**: Auto-timestamped files with export control options
@@ -37,14 +66,8 @@ dotnet run -- --products=BTC-USD
 
 2. You'll see real-time output like:
 ```
-info: AUTHENTICATED MODE: 100 msg/sec = Up to 50 asset pairs supported
 info: Using command line override: [BTC-USD]
 info: Connected to WebSocket at wss://advanced-trade-ws.coinbase.com for BTC-USD
-info: Received candle snapshot for BTC-USD with 100 candles
-info: Snapshot 1/100: BTC-USD $111261 Vol:56.3
-info: Snapshot 10/100: BTC-USD $111526 Vol:14.0
-...
-info: Snapshot 100/100: BTC-USD $109876 Vol:65.4
 info: Heartbeat #516
 info: Heartbeat #517
 info: LIVE: BTC-USD $109893 Vol:66.2 BTC [20:40:00]
@@ -56,18 +79,13 @@ info: Heartbeat #518
 dotnet run -- --products=BTC-USD,SHIB-USD,ETH-USD
 ```
 ```
-info: Snapshot 1/100: BTC-USD $109535 Vol:21.7
-info: Snapshot 1/100: SHIB-USD $0.00001188 Vol:19082653413.0
-info: Snapshot 1/100: ETH-USD $4352.59 Vol:1005.1
 info: Heartbeat #27614  # BTC stream
-info: Heartbeat #13674  # SHIB stream  
+info: Heartbeat #13674  # SHIB stream
 info: Heartbeat #17077  # ETH stream
 info: LIVE: BTC-USD $109535 Vol:21.7 BTC [21:10:00]
 info: LIVE: SHIB-USD $0.00001188 Vol:19082653413.0 BTC [21:10:00]
 info: LIVE: ETH-USD $4352.59 Vol:1005.1 BTC [21:10:00]
 ```
-
-Notice the **intelligent price formatting** and **independent heartbeat tracking** per asset!
 
 ## Configuration
 
@@ -78,7 +96,9 @@ The application uses **only two sources** for asset pairs:
 1. **Manual Override** (highest priority): Command line arguments
 2. **Asset Pairs File** (fallback): `asset-pairs.txt` file
 
-**Note**: Coinbase candles are **fixed at 5-minute intervals** - no timeframe selection available.
+**Note**: Historical granularity supports both seconds and names:
+- Seconds: `60, 300, 900, 3600, 21600, 86400`
+- Names: `OneMinute, FiveMinutes, FifteenMinutes, OneHour, SixHours, OneDay`
 
 ### What You Need to Configure
 
@@ -90,7 +110,7 @@ BTC-USD
 # SOL-USD
 ```
 
-**2. API Credentials** (optional, for accessing your own coinbase trades) - Use user secrets:
+**2. API Credentials** (optional, for accessing your own coinbase trades. Use Coinbase Advanced Trading Api Key & Secret) - Use user secrets:
 ```bash
 dotnet user-secrets set "CoinbaseApi:ApiKeyId" "your-api-key-id"
 dotnet user-secrets set "CoinbaseApi:ApiSecret" "your-api-secret"
@@ -161,7 +181,7 @@ Edit `appsettings.json` for advanced settings:
 ## Data Flow & Timeframes
 
 ### **Coinbase Candles Channel**
-- **Fixed Timeframe**: 5-minute buckets (no user selection available)
+- **Fixed Timeframe**: 5-minute buckets for live WebSocket candle stream
 - **Initial Data**: Snapshot with ~100 historical 5-minute candles (8+ hours)
 - **Live Updates**: Real-time `update` events **every second** when trading occurs
 - **Event Types**: 
@@ -169,11 +189,8 @@ Edit `appsettings.json` for advanced settings:
   - `update`: New/modified candles as trading happens
 
 ### **Custom Timeframes**
-To create other intervals (1-minute, 1-hour, etc.), you can:
-1. Collect the 5-minute candles from our stream
-2. Aggregate them programmatically:
-   - **1-hour candle** = Combine 12 consecutive 5-minute candles
-   - **1-day candle** = Combine 288 consecutive 5-minute candles
+- **Historical REST candles** support configurable granularity (e.g. `60`, `300`, `900`, `3600`, `21600`, `86400`).
+- **Live WebSocket candles** remain fixed to 5-minute intervals from Coinbase.
 
 ### Asset Pairs File (`asset-pairs.txt`)
 ```
@@ -227,6 +244,36 @@ dotnet run -- --products=BTC-USD,ETH-USD,SOL-USD
 # Each asset gets independent stream with proper heartbeat tracking
 ```
 
+#### Historical Day Query + Live Separation
+```bash
+# Historical only (single UTC day)
+dotnet run -- --products=BTC-USD --mode=historical-only --history-date=2026-03-01 --granularity=300
+
+# Equivalent named granularity
+dotnet run -- --products=BTC-USD --mode=historical-only --history-date=2026-03-01 --granularity=FiveMinutes
+
+# Live only from app start onward (5-minute WS candles)
+dotnet run -- --products=BTC-USD --mode=live-only
+
+# Advanced: load history first, then continue with live candles
+dotnet run -- --products=BTC-USD --mode=historical-then-live --history-date=2026-03-01
+```
+
+Notes:
+- In `live-only` mode, Coinbase WebSocket candles are fixed to 5-minute buckets.
+- `--granularity` is accepted only with `--mode=historical-only`.
+- Using `--granularity` with other modes fails fast with a validation error.
+- Historical export filenames preserve your input style:
+  - `--granularity=300` -> `candles_300s_...csv`
+  - `--granularity=FiveMinutes` -> `candles_FiveMinutes_...csv`
+
+Strongest use case for `historical-then-live`:
+- "Give me today's candles so far, then keep streaming new candles without running a second command."
+- Example:
+  ```bash
+  dotnet run -- --products=BTC-USD --mode=historical-then-live --history-date=2026-03-08
+  ```
+
 #### CSV Export Control
 ```bash
 # Auto-export (default)
@@ -236,243 +283,82 @@ dotnet run -- --products=BTC-USD
 dotnet run -- --products=BTC-USD --no-csv
 ```
 
-## API Authentication Setup
+### Command Reference (With Expected Output)
 
-### **Why Authenticate?**
-- **12.5x Rate Limit Increase**: 4 → 50 asset pairs
-- **Private Channels**: Monitor your own trades and balances
-- **Production Ready**: Suitable for real applications
-
-### **Seamless Setup (1-Click):**
-
-**Option 1: Interactive Setup (Recommended)**
+#### 1) Live-only stream (default behavior)
 ```bash
-dotnet run
-# App detects no credentials and prompts:
-# "Set up API credentials now? (y/n): y"
-# Follow the guided setup - credentials stored securely!
+dotnet run -- --products=BTC-USD --mode=live-only
 ```
+Expected:
+- Starts WebSocket stream with heartbeats + live candle updates.
+- No snapshot candle ingestion in live mode.
+- Exports CSV on `Ctrl+C` (default enabled), filename like `candles_300s_BTC_USD_<date>.csv`.
 
-**Option 2: Manual Setup**
-1. **Get Coinbase API Credentials:**
-   - Go to [Coinbase Advanced Trade](https://www.coinbase.com/advanced-trade/api)
-   - Create new API key with **"trade"** permissions
-   - Save your `API Key ID` and `API Secret`
-
-2. **Configure Credentials (Secure):**
-   ```bash
-   dotnet user-secrets set "CoinbaseApi:ApiKeyId" "your-api-key-id"
-   dotnet user-secrets set "CoinbaseApi:ApiSecret" "your-api-secret"
-   ```
-   
-   **Alternative: Direct secrets.json editing:**
-   ```json
-   {
-     "CoinbaseApi": {
-       "MarketDataEndpoint": "wss://advanced-trade-ws.coinbase.com",
-       "UserOrderDataEndpoint": "wss://advanced-trade-ws-user.coinbase.com",
-       "ApiKeyId": "api-key-goes-here",
-       "ApiSecret": "secret-goes-here"
-     }
-   }
-   ```
-   
-   **Note:** Endpoints are already configured in `appsettings.json`, so you only need `ApiKeyId` and `ApiSecret` in secrets. The complete structure above shows all possible CoinbaseApi settings for reference.
-
-3. **Restart Application:**
-   ```bash
-   dotnet run
-   # You'll see: "AUTHENTICATED MODE: 100 msg/sec = Up to 50 asset pairs supported"
-   ```
-
-**Security:** Credentials are stored securely in user secrets, not in code.
-
-**Disable Prompts:** Set `"PromptForApiSetup": false` in config to skip interactive setup.
-
-### **User Secrets Location**
-
-The `secrets.json` file is automatically created by .NET in:
-- **Windows:** `%APPDATA%\Microsoft\UserSecrets\[user-secrets-id]\secrets.json`
-- **macOS/Linux:** `~/.microsoft/usersecrets/[user-secrets-id]/secrets.json`
-
-You can also edit it directly using: `dotnet user-secrets list` to view current secrets.
-
-## Data Format
-
-The application streams OHLCV (Open, High, Low, Close, Volume) candle data in real-time. Each candle includes:
-
-- **Time**: Timestamp of the candle
-- **Open**: Opening price
-- **High**: Highest price during the period
-- **Low**: Lowest price during the period
-- **Close**: Closing price
-- **Volume**: Trading volume during the period
-
-## CSV Export
-
-### **Automatic Export Features**
-- **Smart Filenames**: `candles_5min_BTC_USD_08-25-2025.csv` (includes candle type and date)
-- **Separate Files**: Each asset gets its own CSV file for better organization
-- **Descriptive Headers**: Includes export metadata and candle type information
-- **Proper Spacing**: Clean, readable format with spaces after commas
-- **Volume Accuracy**: Base asset volume (BTC volume for BTC-USD, ETH volume for ETH-USD)
-
-### **Export Control Options**
-
-#### **Default Behavior - Auto Export**
+#### 2) Historical-only by date (seconds granularity)
 ```bash
-dotnet run -- --products=BTC-USD,ETH-USD
-# [Ctrl+C] → Automatically creates CSV files:
-# ✅ candles_5min_BTC_USD_08-25-2025.csv
-# ✅ candles_5min_ETH_USD_08-25-2025.csv
+dotnet run -- --products=BTC-USD --mode=historical-only --history-date=2026-03-01 --granularity=300
 ```
+Expected:
+- Loads historical candles for that UTC day (`00:00:00` to `23:59:59` window).
+- Uses chunked REST retrieval at max 300 candles/request.
+- Auto-exports and exits automatically, filename like `candles_300s_BTC_USD_<date>.csv`.
 
-#### **Disable Auto Export**
+#### 3) Historical-only by date (named granularity)
 ```bash
-# Option 1: Command line flag
-dotnet run -- --products=BTC-USD --no-csv
-dotnet run -- --products=BTC-USD --csv=false
-
-# Option 2: Configuration
-# Set "AutoExportOnExit": false in appsettings.json
+dotnet run -- --products=BTC-USD --mode=historical-only --history-date=2026-03-01 --granularity=FiveMinutes
 ```
+Expected:
+- Same behavior as `--granularity=300`.
+- Filename preserves named style: `candles_FiveMinutes_BTC_USD_<date>.csv`.
 
-#### **Interactive Export Prompt**
-When auto-export is disabled, you'll be prompted at shutdown:
-```
-📊 Would you like to export the collected data to CSV files? (y/n):
-```
-- Press **Y** = Export CSV files
-- Press **N** = Discard data
-- Press **Enter** = Default to Yes
-
-### **CSV File Format**
-
-**Filename**: `candles_5min_BTC_USD_08-25-2025.csv`
-
-**Content Example**:
-```csv
-2025-08-25 21:55:25 UTC, 100 Candles (5-minute), 2025-08-25 05:20:00 to 2025-08-25 21:55:00
-
-Asset: BTC-USD, Time: 2025-08-25 05:20:00, Open: 112587.60000000, High: 112619.00000000, Low: 112486.08000000, Close: 112487.66000000, Volume: 6.95725607
-Asset: BTC-USD, Time: 2025-08-25 05:25:00, Open: 112487.64000000, High: 112549.57000000, Low: 112461.93000000, Close: 112505.61000000, Volume: 8.80207340
-...
-```
-
-### **Volume Interpretation**
-- **BTC-USD**: Volume = BTC units traded (e.g., Volume: 6.95725607 BTC ≈ How many Bitcoin Were Traded in that candle )
-- **ETH-USD**: Volume = ETH units traded 
-- **SHIB-USD**: Volume = SHIB units traded
-- **Standard OHLCV**: Follows industry-standard candlestick data format
-
-### **Export Control Options**
-
-**Command Line Flags**:
+#### 4) Historical-then-live (advanced)
 ```bash
-# Default: Auto-export enabled
-dotnet run -- --products=BTC-USD
-
-**appsettings.json**:
-```json
-{
-  "AppConfiguration": {
-    "AutoExportOnExit": true,          // Auto-create CSV on exit
-    "PromptForExportIfDisabled": true, // Ask user if auto-export disabled
-    "CsvExportPath": "candles.csv",    // Legacy single-file path
-    "MaxCandlesInMemory": {            // OR "Enabled": false, ommit the amount
-  "Enabled": true,
-  "Amount": 5000
-}
-  }
-}
-
-# Disable auto-export to .csv
-dotnet run -- --products=BTC-USD --no-csv
-dotnet run -- --products=BTC-USD --csv=false
+dotnet run -- --products=BTC-USD --mode=historical-then-live --history-date=2026-03-08
 ```
+Expected:
+- Backfills from `2026-03-08 00:00:00` UTC to current UTC time using 5-minute candles.
+- Then continues live WebSocket streaming.
+- On `Ctrl+C`, exports one continuous 5-minute series to CSV.
 
-**Interactive Prompt**: When auto-export is disabled, you'll be prompted at shutdown to save data.
-
-### **Multiple Asset Handling**
-- **Individual Files**: Each asset gets its own timestamped CSV file
-- **No Combined File**: Cleaner organization with separate files per asset
-- **Consistent Naming**: `candles_5min_{ASSET}_{DATE}.csv` format
-
-### **Manual Export During Runtime**
-The application supports manual export via the `ExportCurrentDataAsync()` method for programmatic integration.
-
-##Monitoring
-
-The application provides real-time monitoring including:
-- Total candles received
-- Total volume processed
-- Candles per second rate
-- Volume per second rate
-- Data range information
-- Connection status and health
-
-## Architecture
-
-- **Interfaces**: Clean separation of concerns with interface-based design
-- **Services**: Modular services for different functionalities
-- **Models**: Strongly-typed data models
-- **Configuration**: Flexible configuration management
-- **Logging**: Structured logging throughout the pipeline
-- **Error Handling**: Comprehensive error handling and recovery
-
-## Development
-
-### Project Structure
+#### 5) Invalid: granularity with live-only
+```bash
+dotnet run -- --products=BTC-USD --mode=live-only --granularity=60
 ```
-Advanced-Market-Data/
-├── Interfaces/          # Service interfaces
-├── Models/             # Data models and configuration
-├── Services/           # Implementation of services
-├── Utility/            # Utility classes and helpers
-├── Program.cs          # Main application entry point
-├── appsettings.json    # Configuration file
-└── TODO.md            # Development progress tracking
+Expected:
+- Fails fast with validation error:
+  - `--granularity is only supported when --mode=historical-only.`
+
+#### 6) Optional: disable auto-export
+```bash
+dotnet run -- --products=BTC-USD --mode=live-only --no-csv
 ```
+Expected:
+- Streams normally.
+- No automatic CSV export on shutdown.
 
-### Key Services
-- **MarketDataStreamer**: Main orchestrator for streaming operations
-- **CandleStreamService**: WebSocket connection and candle parsing
-- **CsvService**: CSV import/export functionality
-- **AnalyticsService**: Basic technical analysis (SMA, etc.)
-- **MonitoringService**: Real-time performance monitoring
+## CSV Output
 
-## Error Handling
+- **Naming**
+  - Live/default export: `candles_300s_<PRODUCT>_<MM-dd-yyyy>.csv`
+  - Historical numeric granularity: `candles_<seconds>s_<PRODUCT>_<MM-dd-yyyy>.csv`
+  - Historical named granularity: `candles_<Name>_<PRODUCT>_<MM-dd-yyyy>.csv` (example: `FiveMinutes`)
+- **Header format**
+  - `<export UTC timestamp>, <count> Candles, <first candle time> to <last candle time>`
+- **Rows**
+  - `Asset: <Product>, Time: <yyyy-MM-dd HH:mm:ss>, Open: ..., High: ..., Low: ..., Close: ..., Volume: ...`
 
-The application includes robust error handling:
-- Automatic WebSocket reconnection (up to 5 attempts)
-- Graceful degradation when individual product streams fail
-- Comprehensive logging of all errors and warnings
-- Memory management to prevent memory leaks
+## Services Used
 
-## Logging
+- `MarketDataStreamer`: mode selection, orchestration, export lifecycle.
+- `WebSocketStreamService`: live WebSocket connection, heartbeat handling, candle updates.
+- `CoinbaseRestService`: historical REST retrieval with chunking.
+- `CsvService`: CSV write/read utilities.
 
-Logs are structured and include:
-- Connection status and WebSocket events
-- Data reception and processing
-- Error conditions and recovery attempts
-- Performance metrics and statistics
-- Export operations and file operations
+## Notes
 
-## Use Cases
-
-- **Real-time Trading**: Monitor cryptocurrency prices in real-time
-- **Data Analysis**: Collect historical data for analysis
-- **Algorithmic Trading**: Feed data to trading algorithms
-- **Research**: Academic or market research purposes
-- **Integration**: Use as a data source for other applications
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+- This project currently focuses on OHLCV ingestion and export, not analytics pipelines.
+- For historical data caveats and endpoint behavior, see:
+  - [Get product candles (Exchange API)](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-candles)
 
 ## License
 

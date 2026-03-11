@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Http;
+using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
@@ -84,10 +84,17 @@ Console.CancelKeyPress += async (sender, e) =>
 
 // Start the main service and keep it running
 var streamer = host.Services.GetRequiredService<IMarketDataStreamer>();
+var configuration = host.Services.GetRequiredService<IConfiguration>();
 
 try
 {
     await streamer.StartAsync();
+
+    if (IsHistoricalOnlyRun(args, configuration))
+    {
+        Console.WriteLine("✅ Historical-only run completed. Exiting automatically.");
+        return;
+    }
     
     // Keep the application running until manually stopped
     await Task.Delay(Timeout.Infinite);
@@ -95,4 +102,17 @@ try
 catch (OperationCanceledException)
 {
     Console.WriteLine("Application was cancelled.");
+}
+
+static bool IsHistoricalOnlyRun(string[] args, IConfiguration configuration)
+{
+    var modeArg = args.FirstOrDefault(a => a.StartsWith("--mode=", StringComparison.OrdinalIgnoreCase));
+    if (modeArg is not null)
+    {
+        var modeValue = modeArg.Substring("--mode=".Length).Trim().ToLowerInvariant();
+        return modeValue == "historical-only";
+    }
+
+    var configuredMode = configuration["AppConfiguration:RunMode"]?.Trim().ToLowerInvariant();
+    return configuredMode == "historical-only";
 }
