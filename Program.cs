@@ -1,13 +1,14 @@
+using System.Threading;
+using AdvancedMarketData.Core;
 using Microsoft.Extensions.Http;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Configuration;
 using AdvancedMarketData.Streaming;
 using AdvancedMarketData.Interfaces;
 using AdvancedMarketData.Core.Helpers;
 using AdvancedMarketData.Core.Services;
 using AdvancedMarketData.Core.Interfaces;
-using AdvancedMarketData.Core;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 var host = Host.CreateDefaultBuilder(args)
@@ -60,8 +61,11 @@ var host = Host.CreateDefaultBuilder(args)
         services.AddSingleton<ICsvService, CsvService>();
         services.AddSingleton<IAnalyticsService, AnalyticsService>();
         services.AddSingleton<IMarketDataStreamer, MarketDataStreamer>();
+        services.AddSingleton<IApiCommandExecutor>(sp => (IApiCommandExecutor)sp.GetRequiredService<IMarketDataStreamer>());
+        services.AddSingleton<ICommandWhitelistValidator, CommandWhitelistValidator>();
         services.AddSingleton<IWebSocketStreamService, WebSocketStreamService>();
         services.AddSingleton<ICoinbaseRestService, CoinbaseRestService>();
+        services.AddHostedService<LocalApiHostedService>();
 
     })
     .Build();
@@ -78,6 +82,7 @@ Console.CancelKeyPress += async (sender, e) =>
     var streamer = host.Services.GetRequiredService<IMarketDataStreamer>();
     Console.WriteLine("📊 Stopping service and exporting data...");
     await streamer.StopAsync();
+    await host.StopAsync();
     Console.WriteLine("✅ Shutdown complete.");
     Environment.Exit(0);
 };
@@ -85,15 +90,26 @@ Console.CancelKeyPress += async (sender, e) =>
 // Start the main service and keep it running
 var streamer = host.Services.GetRequiredService<IMarketDataStreamer>();
 var configuration = host.Services.GetRequiredService<IConfiguration>();
+var localApiEnabled = configuration.GetValue("AppConfiguration:LocalApi:Enabled", false);
+var localApiApiOnlyMode = configuration.GetValue("AppConfiguration:LocalApi:ApiOnlyMode", false);
 
 try
 {
-    await streamer.StartAsync();
+    await host.StartAsync();
 
-    if (IsHistoricalOnlyRun(args, configuration))
+    if (!localApiApiOnlyMode)
     {
-        Console.WriteLine("✅ Historical-only run completed. Exiting automatically.");
-        return;
+        await streamer.StartAsync();
+
+        if (IsHistoricalOnlyRun(args, configuration))
+        {
+            Console.WriteLine("✅ Historical-only run completed. Exiting automatically.");
+            return;
+        }
+    }
+    else if (localApiEnabled)
+    {
+        Console.WriteLine("✅ Local API command mode active. Waiting for API commands...");
     }
     
     // Keep the application running until manually stopped
@@ -102,6 +118,10 @@ try
 catch (OperationCanceledException)
 {
     Console.WriteLine("Application was cancelled.");
+}
+finally
+{
+    await host.StopAsync();
 }
 
 static bool IsHistoricalOnlyRun(string[] args, IConfiguration configuration)

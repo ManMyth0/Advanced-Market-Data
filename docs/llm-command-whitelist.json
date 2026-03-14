@@ -1,0 +1,70 @@
+{
+  "version": "1.0",
+  "description": "Allowed local API commands for LLM integration.",
+  "restrictedActions": [
+    "access_log_files",
+    "request_log_endpoints",
+    "issue_log_commands"
+  ],
+  "commands": [
+    {
+      "command": "start_live_stream",
+      "requiredArgs": ["products"],
+      "optionalArgs": [],
+      "example": {
+        "command": "start_live_stream",
+        "args": {
+          "products": "BTC-USD,ETH-USD"
+        }
+      },
+      "expectedOutcome": "Starts live WebSocket candle streaming (5-minute buckets) for provided products."
+    },
+    {
+      "command": "run_historical_only",
+      "requiredArgs": ["products", "history_date", "granularity"],
+      "optionalArgs": [],
+      "example": {
+        "command": "run_historical_only",
+        "args": {
+          "products": "BTC-USD",
+          "history_date": "2026-03-01",
+          "granularity": "OneMinute"
+        }
+      },
+      "expectedOutcome": "Fetches a full UTC day of historical candles and exports CSV output."
+    },
+    {
+      "command": "run_historical_then_live",
+      "requiredArgs": ["products", "history_date"],
+      "optionalArgs": [],
+      "example": {
+        "command": "run_historical_then_live",
+        "args": {
+          "products": "BTC-USD",
+          "history_date": "2026-03-01"
+        }
+      },
+      "expectedOutcome": "Backfills historical data from the provided date to now, then starts live streaming."
+    },
+    {
+      "command": "stop_stream",
+      "requiredArgs": [],
+      "optionalArgs": [],
+      "example": {
+        "command": "stop_stream",
+        "args": {}
+      },
+      "expectedOutcome": "Stops active streaming and executes export-on-exit behavior if enabled."
+    },
+    {
+      "command": "get_status",
+      "requiredArgs": [],
+      "optionalArgs": [],
+      "example": {
+        "command": "get_status",
+        "args": {}
+      },
+      "expectedOutcome": "Returns current mode, active products, and candle counts."
+    }
+  ]
+}

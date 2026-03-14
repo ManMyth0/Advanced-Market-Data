@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Extensions.Logging;
 using AdvancedMarketData.Interfaces;
 using AdvancedMarketData.Core.Models;
@@ -8,7 +9,7 @@ using Microsoft.Extensions.Configuration;
 
 namespace AdvancedMarketData.Streaming;
 
-public class MarketDataStreamer : IMarketDataStreamer
+public class MarketDataStreamer : IMarketDataStreamer, IApiCommandExecutor
 {
     private enum StreamRunMode
     {
@@ -23,14 +24,19 @@ public class MarketDataStreamer : IMarketDataStreamer
     private readonly ICoinbaseRestService _coinbaseRestService;
     private readonly IConfiguration _configuration;
     private readonly Ed25519JwtHelper _jwtHelper;
-    private readonly CancellationTokenSource _cancellationTokenSource;
+    private CancellationTokenSource _cancellationTokenSource;
     private readonly List<Candle> _candles;
     private readonly object _candlesLock = new object();
+    private readonly SemaphoreSlim _apiCommandLock = new(1, 1);
     private StreamRunMode _runMode = StreamRunMode.LiveOnly;
     private int _maxCandlesInMemory = 1000;
     private int _selectedGranularitySeconds = CandleGranularity.FiveMinutes;
     private string _selectedGranularityLabel = "300s";
     private bool _hasExportedDuringRun;
+    private volatile bool _isStreaming;
+    private Task? _activeStreamingTask;
+    private string[] _activeProducts = Array.Empty<string>();
+    private string[] _activeChannels = Array.Empty<string>();
 
     public MarketDataStreamer(
         ILogger<MarketDataStreamer> logger,
@@ -57,11 +63,15 @@ public class MarketDataStreamer : IMarketDataStreamer
     {
         try
         {
+            ResetCancellationTokenSourceIfNeeded();
+            _hasExportedDuringRun = false;
             _logger.LogInformation("Starting market data stream...");
             
             // Get configuration for asset pairs and channels
             var productIds = GetProductIds();
             var channels = GetChannels();
+            _activeProducts = productIds;
+            _activeChannels = channels;
             var historyDate = GetHistoryDateFromArgs();
             _runMode = GetRunMode(historyDate);
             _maxCandlesInMemory = GetMaxCandlesInMemory();
@@ -123,6 +133,7 @@ public class MarketDataStreamer : IMarketDataStreamer
             {
                 AutoExportIfEnabled("historical-only completion");
                 _logger.LogInformation("Historical-only mode completed.");
+                _isStreaming = false;
                 return;
             }
 
@@ -136,7 +147,9 @@ public class MarketDataStreamer : IMarketDataStreamer
                 StartProductStreamAsync(productId, channels, _cancellationTokenSource.Token));
             
             // Wait for all streaming tasks, but handle cancellation properly
-            await Task.WhenAll(streamingTasks);
+            _isStreaming = true;
+            _activeStreamingTask = Task.WhenAll(streamingTasks);
+            await _activeStreamingTask;
         }
         catch (OperationCanceledException)
         {
@@ -146,6 +159,10 @@ public class MarketDataStreamer : IMarketDataStreamer
         {
             _logger.LogError(ex, "Error starting market data stream");
             throw;
+        }
+        finally
+        {
+            _isStreaming = false;
         }
     }
 
@@ -521,9 +538,7 @@ public class MarketDataStreamer : IMarketDataStreamer
         }
         
         _cancellationTokenSource.Cancel();
-        
-        // Unsubscribe from events
-        _webSocketStreamService.OnCandleReceived -= OnCandleReceived;
+        _isStreaming = false;
         return Task.CompletedTask;
     }
 
@@ -642,7 +657,364 @@ public class MarketDataStreamer : IMarketDataStreamer
 
     public void Dispose()
     {
+        _webSocketStreamService.OnCandleReceived -= OnCandleReceived;
         _cancellationTokenSource?.Cancel();
         _cancellationTokenSource?.Dispose();
+        _apiCommandLock.Dispose();
+    }
+
+    public ApiStatusSnapshot GetApiStatusSnapshot()
+    {
+        var mode = _isStreaming ? _runMode.ToString() : "Idle";
+        return new ApiStatusSnapshot
+        {
+            IsStreaming = _isStreaming,
+            ActiveMode = mode,
+            ActiveProducts = _activeProducts,
+            CollectedCandles = _candles.Count,
+            SelectedGranularitySeconds = _selectedGranularitySeconds,
+            SelectedGranularityLabel = _selectedGranularityLabel
+        };
+    }
+
+    public async Task<ApiCommandExecutionResponse> ExecuteApiCommandAsync(ApiCommandRequest request, CancellationToken ct = default)
+    {
+        await _apiCommandLock.WaitAsync(ct);
+        try
+        {
+            var command = request.Command.Trim().ToLowerInvariant();
+            request.Args ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            return command switch
+            {
+                "get_status" => BuildSuccessResponse("Status snapshot returned.", new Dictionary<string, object?>
+                {
+                    ["status"] = GetApiStatusSnapshot()
+                }),
+                "stop_stream" => await ExecuteStopCommandAsync(),
+                "start_live_stream" => await ExecuteStartLiveCommandAsync(request.Args, ct),
+                "run_historical_only" => await ExecuteHistoricalOnlyCommandAsync(request.Args, ct),
+                "run_historical_then_live" => await ExecuteHistoricalThenLiveCommandAsync(request.Args, ct),
+                _ => new ApiCommandExecutionResponse
+                {
+                    Success = false,
+                    Status = "failed",
+                    Message = $"Unsupported command '{request.Command}'."
+                }
+            };
+        }
+        finally
+        {
+            _apiCommandLock.Release();
+        }
+    }
+
+    private async Task<ApiCommandExecutionResponse> ExecuteStopCommandAsync()
+    {
+        await StopAsync();
+        return BuildSuccessResponse("Stream stopped.", new Dictionary<string, object?>
+        {
+            ["status"] = GetApiStatusSnapshot()
+        });
+    }
+
+    private async Task<ApiCommandExecutionResponse> ExecuteStartLiveCommandAsync(
+        IReadOnlyDictionary<string, string> args,
+        CancellationToken ct)
+    {
+        if (_isStreaming)
+        {
+            return new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = "A stream is already active. Stop it before starting another."
+            };
+        }
+
+        var products = ParseProductsArgument(args);
+        if (products.Length == 0)
+        {
+            return new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = "Argument 'products' must include at least one product id."
+            };
+        }
+
+        _ = Task.Run(async () =>
+        {
+            await ExecuteConfiguredRunAsync(
+                StreamRunMode.LiveOnly,
+                products,
+                null,
+                CandleGranularity.FiveMinutes,
+                "300s",
+                ct);
+        }, ct);
+
+        return BuildSuccessResponse("Live stream started.", new Dictionary<string, object?>
+        {
+            ["products"] = products,
+            ["mode"] = "live-only"
+        });
+    }
+
+    private async Task<ApiCommandExecutionResponse> ExecuteHistoricalOnlyCommandAsync(
+        IReadOnlyDictionary<string, string> args,
+        CancellationToken ct)
+    {
+        if (_isStreaming)
+        {
+            return new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = "Cannot run historical-only while a stream is active."
+            };
+        }
+
+        var products = ParseProductsArgument(args);
+        if (products.Length == 0)
+        {
+            return new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = "Argument 'products' must include at least one product id."
+            };
+        }
+
+        if (!TryParseHistoryDate(args, out var historyDate, out var historyError))
+        {
+            return new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = historyError
+            };
+        }
+
+        if (!TryParseGranularity(args, out var granularitySeconds, out var label, out var granularityError))
+        {
+            return new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = granularityError
+            };
+        }
+
+        await ExecuteConfiguredRunAsync(
+            StreamRunMode.HistoricalOnly,
+            products,
+            historyDate,
+            granularitySeconds,
+            label,
+            ct);
+
+        return BuildSuccessResponse("Historical-only run completed.", new Dictionary<string, object?>
+        {
+            ["products"] = products,
+            ["historyDate"] = historyDate.ToString("yyyy-MM-dd"),
+            ["granularity"] = label,
+            ["status"] = GetApiStatusSnapshot()
+        });
+    }
+
+    private Task<ApiCommandExecutionResponse> ExecuteHistoricalThenLiveCommandAsync(
+        IReadOnlyDictionary<string, string> args,
+        CancellationToken ct)
+    {
+        if (_isStreaming)
+        {
+            return Task.FromResult(new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = "A stream is already active. Stop it before starting another."
+            });
+        }
+
+        var products = ParseProductsArgument(args);
+        if (products.Length == 0)
+        {
+            return Task.FromResult(new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = "Argument 'products' must include at least one product id."
+            });
+        }
+
+        if (!TryParseHistoryDate(args, out var historyDate, out var historyError))
+        {
+            return Task.FromResult(new ApiCommandExecutionResponse
+            {
+                Success = false,
+                Status = "failed",
+                Message = historyError
+            });
+        }
+
+        _ = Task.Run(async () =>
+        {
+            await ExecuteConfiguredRunAsync(
+                StreamRunMode.HistoricalThenLive,
+                products,
+                historyDate,
+                CandleGranularity.FiveMinutes,
+                "300s",
+                ct);
+        }, ct);
+
+        return Task.FromResult(BuildSuccessResponse("Historical-then-live run started.", new Dictionary<string, object?>
+        {
+            ["products"] = products,
+            ["historyDate"] = historyDate.ToString("yyyy-MM-dd"),
+            ["mode"] = "historical-then-live"
+        }));
+    }
+
+    private async Task ExecuteConfiguredRunAsync(
+        StreamRunMode mode,
+        string[] productIds,
+        DateOnly? historyDate,
+        int granularitySeconds,
+        string granularityLabel,
+        CancellationToken ct)
+    {
+        ResetCancellationTokenSourceIfNeeded();
+        _hasExportedDuringRun = false;
+        _runMode = mode;
+        _selectedGranularitySeconds = granularitySeconds;
+        _selectedGranularityLabel = granularityLabel;
+        _maxCandlesInMemory = GetMaxCandlesInMemory();
+        _activeProducts = productIds;
+        _activeChannels = GetChannels();
+
+        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cancellationTokenSource.Token);
+        try
+        {
+            if ((mode == StreamRunMode.HistoricalOnly || mode == StreamRunMode.HistoricalThenLive) && historyDate.HasValue)
+            {
+                var startUtc = historyDate.Value.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+                var endUtcExclusive = mode == StreamRunMode.HistoricalOnly
+                    ? startUtc.AddDays(1)
+                    : DateTime.UtcNow;
+
+                await LoadHistoricalCandlesAsync(
+                    productIds,
+                    startUtc,
+                    endUtcExclusive,
+                    granularitySeconds,
+                    linkedCts.Token);
+            }
+
+            if (mode == StreamRunMode.HistoricalOnly)
+            {
+                AutoExportIfEnabled("historical-only completion (api)");
+                _isStreaming = false;
+                return;
+            }
+
+            var streamingTasks = productIds.Select(productId =>
+                StartProductStreamAsync(productId, _activeChannels, linkedCts.Token));
+
+            _isStreaming = true;
+            _activeStreamingTask = Task.WhenAll(streamingTasks);
+            await _activeStreamingTask;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Configured API run canceled.");
+        }
+        finally
+        {
+            _isStreaming = false;
+            linkedCts.Dispose();
+        }
+    }
+
+    private static string[] ParseProductsArgument(IReadOnlyDictionary<string, string> args)
+    {
+        if (!args.TryGetValue("products", out var productsRaw) || string.IsNullOrWhiteSpace(productsRaw))
+        {
+            return Array.Empty<string>();
+        }
+
+        return productsRaw.Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(p => p.Trim().ToUpperInvariant())
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .ToArray();
+    }
+
+    private static bool TryParseHistoryDate(
+        IReadOnlyDictionary<string, string> args,
+        out DateOnly historyDate,
+        out string error)
+    {
+        historyDate = default;
+        error = string.Empty;
+
+        if (!args.TryGetValue("history_date", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            error = "Argument 'history_date' is required in YYYY-MM-DD format.";
+            return false;
+        }
+
+        if (!DateOnly.TryParseExact(value.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out historyDate))
+        {
+            error = $"Invalid history_date '{value}'. Expected format YYYY-MM-DD.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryParseGranularity(
+        IReadOnlyDictionary<string, string> args,
+        out int granularitySeconds,
+        out string label,
+        out string error)
+    {
+        granularitySeconds = CandleGranularity.FiveMinutes;
+        label = "300s";
+        error = string.Empty;
+
+        if (!args.TryGetValue("granularity", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            error = "Argument 'granularity' is required for historical-only runs.";
+            return false;
+        }
+
+        if (!CandleGranularity.TryParse(value.Trim(), out granularitySeconds, out label))
+        {
+            error = $"Invalid granularity '{value}'. Supported values: {CandleGranularity.SupportedValuesText}.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private ApiCommandExecutionResponse BuildSuccessResponse(string message, Dictionary<string, object?> data)
+    {
+        return new ApiCommandExecutionResponse
+        {
+            Success = true,
+            Status = "success",
+            Message = message,
+            Data = data
+        };
+    }
+
+    private void ResetCancellationTokenSourceIfNeeded()
+    {
+        if (_cancellationTokenSource.IsCancellationRequested)
+        {
+            _cancellationTokenSource.Dispose();
+            _cancellationTokenSource = new CancellationTokenSource();
+        }
     }
 }

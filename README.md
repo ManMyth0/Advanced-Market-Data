@@ -360,6 +360,52 @@ Expected:
 - For historical data caveats and endpoint behavior, see:
   - [Get product candles (Exchange API)](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-candles)
 
+## Local API for LLM Integration
+
+This app can expose a local JSON API so any local LLM client can issue approved commands without shell access.
+
+- **Enable API in `appsettings.json`**
+  - `AppConfiguration:LocalApi:Enabled = true`
+  - `AppConfiguration:LocalApi:ApiOnlyMode = true`
+  - `AppConfiguration:LocalApi:Host = 127.0.0.1`
+  - `AppConfiguration:LocalApi:Port = 5058`
+  - `AppConfiguration:LocalApi:AuditLog:Directory = logs`
+  - `AppConfiguration:LocalApi:AuditLog:RetentionDays = 31`
+- **Run the app**
+  - `dotnet run`
+- **Core endpoints**
+  - `GET /health`
+  - `GET /docs/whitelist`
+  - `GET /docs/readme`
+  - `POST /commands/execute`
+- **Whitelisted commands**
+  - `start_live_stream`
+  - `run_historical_only`
+  - `run_historical_then_live`
+  - `stop_stream`
+  - `get_status`
+- **Whitelist document**
+  - `docs/llm-command-whitelist.json`
+
+### API Audit Logging
+
+Every `POST /commands/execute` attempt writes an audit log entry with:
+
+- UTC timestamp
+- command name
+- request ID
+- sanitized args summary
+- success/failure
+- failure type and message (when failed)
+- file output at `logs/api-command-audit-YYYY-MM-DD.jsonl`
+- automatic retention cleanup after 31 days
+
+Security guardrails:
+
+- Log files are **not** exposed through API endpoints.
+- Any log-related command request is rejected by whitelist validation.
+- `/docs/readme` always serves `README.md` only (no arbitrary file path reads).
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
